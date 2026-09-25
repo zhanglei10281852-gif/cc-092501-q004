@@ -44,6 +44,19 @@ class InversionRequest(BaseModel):
     model_version: str = Field(default="mix-1", min_length=1, max_length=40)
 
 
+class IntervalRequest(BaseModel):
+    """对已完成点估计追加区间估计；不修改原始点估计结果。"""
+    method: str = Field(default="parametric-bootstrap",
+                        pattern="^(parametric-bootstrap|deterministic-profile)$")
+    confidence_level: float = Field(default=0.95, gt=0.5, lt=1.0)
+    random_seed: int = Field(default=20260924, ge=0, le=2**63 - 1)
+    n_bootstrap: int = Field(default=1000, ge=30, le=20000)
+    grid_points: int = Field(default=41, ge=11, le=201)
+    max_iterations: int | None = Field(default=None, ge=10, le=10000)
+    tolerance: float | None = Field(default=None, gt=0, le=0.1)
+
+
+
 class TransportRequest(BaseModel):
     source_concentration: float = Field(..., ge=0, le=1000000)
     distance_m: float = Field(..., gt=0, le=1000000)

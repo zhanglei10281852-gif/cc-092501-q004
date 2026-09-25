@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.hydro.schemas import EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
+from app.hydro.schemas import EndmemberCreate, IntervalRequest, InversionRequest, SampleCreate, TransportRequest, WellCreate
 from app.hydro.service import HydroService
 
 router=APIRouter(prefix="/api/hydro",tags=["地下水科学计算"])
@@ -46,6 +46,30 @@ def run_inversion(task_id:int,worker_id:str=Query(...,min_length=1)):
     try: return service().run_inversion(task_id,worker_id)
     except KeyError as exc: raise HTTPException(404,"任务不存在") from exc
     except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.post("/inversions/{inversion_id}/intervals",status_code=202)
+def enqueue_interval(inversion_id:int,payload:IntervalRequest):
+    try: return service().enqueue_interval(inversion_id,payload.model_dump(exclude_none=True))
+    except KeyError as exc: raise HTTPException(404,"点估计任务不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.post("/intervals/{interval_id}/run")
+def run_interval(interval_id:int,worker_id:str=Query(...,min_length=1)):
+    try: return service().run_interval(interval_id,worker_id)
+    except KeyError as exc: raise HTTPException(404,"区间任务不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.get("/intervals")
+def list_intervals(sample_id:int|None=None,model_version:str|None=None,
+                   confidence_level:float|None=Query(None,gt=0.5,lt=1.0),
+                   method:str|None=Query(None,pattern="^(parametric-bootstrap|deterministic-profile)$")):
+    return service().list_intervals(sample_id,model_version,confidence_level,method)
+
+@router.get("/intervals/{interval_id}")
+def get_interval(interval_id:int):
+    value=service().get_interval(interval_id)
+    if value is None: raise HTTPException(404,"区间任务不存在")
+    return value
 
 @router.post("/wells/{well_id}/transport",status_code=201)
 def run_transport(well_id:int,payload:TransportRequest):

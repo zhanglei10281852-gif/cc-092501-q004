@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.hydro.intervals import BOOTSTRAP, PROFILE, bootstrap_intervals, profile_intervals
 
 
 SCHEMA = """
@@ -35,6 +36,18 @@ CREATE TABLE IF NOT EXISTS hydro_inversions (
  worker_id TEXT NOT NULL DEFAULT '', result_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '',
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hydro_inversion_intervals (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ inversion_id INTEGER NOT NULL REFERENCES hydro_inversions(id) ON DELETE RESTRICT,
+ sample_id INTEGER NOT NULL REFERENCES hydro_samples(id) ON DELETE RESTRICT,
+ task_key TEXT NOT NULL UNIQUE, method TEXT NOT NULL, model_version TEXT NOT NULL,
+ confidence_level REAL NOT NULL, random_seed INTEGER, n_bootstrap INTEGER, grid_points INTEGER,
+ config_json TEXT NOT NULL, point_snapshot_json TEXT NOT NULL,
+ input_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','done','failed')),
+ attempts INTEGER NOT NULL DEFAULT 0, worker_id TEXT NOT NULL DEFAULT '',
+ result_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS hydro_transport_runs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, well_id INTEGER NOT NULL REFERENCES hydro_wells(id) ON DELETE RESTRICT,
  task_key TEXT NOT NULL UNIQUE, model_version TEXT NOT NULL, input_json TEXT NOT NULL,
@@ -46,6 +59,8 @@ CREATE TABLE IF NOT EXISTS hydro_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_hydro_samples_well ON hydro_samples(well_id,sampled_at);
 CREATE INDEX IF NOT EXISTS idx_hydro_inversions_status ON hydro_inversions(status,created_at);
+CREATE INDEX IF NOT EXISTS idx_hydro_intervals_lookup ON hydro_inversion_intervals(sample_id,model_version,confidence_level,method);
+CREATE INDEX IF NOT EXISTS idx_hydro_intervals_status ON hydro_inversion_intervals(status,created_at);
 """
 
 
@@ -165,6 +180,103 @@ class HydroService:
         with transaction(immediate=True) as connection:
             connection.execute("UPDATE hydro_inversions SET status='done',result_json=?,error='',updated_at=? WHERE id=?",(json.dumps(result,ensure_ascii=False),_now(),task_id))
             return dict(connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(task_id,)).fetchone())
+
+    def enqueue_interval(self, inversion_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """为已完成的点估计入队区间估计任务。
+
+        幂等键只取决于「点估计任务 + 区间配置 + 点估计结果快照」：同一配置重试
+        命中同一任务行，结果只写入区间表，原始 hydro_inversions 行不被修改。
+        """
+        inversion=self.connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(inversion_id,)).fetchone()
+        if inversion is None: raise KeyError("inversion_not_found")
+        if inversion["status"]!="done": raise ValueError("inversion_not_done")
+        point_result=json.loads(inversion["result_json"])
+        config={
+            "method":payload["method"],
+            "confidence_level":payload["confidence_level"],
+        }
+        if payload.get("max_iterations") is not None:
+            config["max_iterations"]=payload["max_iterations"]
+        if payload.get("tolerance") is not None:
+            config["tolerance"]=payload["tolerance"]
+        if payload["method"]==BOOTSTRAP:
+            config.update({"random_seed":payload["random_seed"],"n_bootstrap":payload["n_bootstrap"]})
+        else:
+            config.update({"grid_points":payload["grid_points"]})
+        point_snapshot={"status":inversion["status"],"result_json":point_result,
+                        "model_version":inversion["model_version"],"method":inversion["method"]}
+        key=_digest({"inversion_id":inversion_id,"config":config,"point_snapshot":point_snapshot})
+        now=_now()
+        with transaction(immediate=True) as connection:
+            old=connection.execute("SELECT * FROM hydro_inversion_intervals WHERE task_key=?",(key,)).fetchone()
+            if old: return dict(old)
+            cursor=connection.execute(
+                "INSERT INTO hydro_inversion_intervals(inversion_id,sample_id,task_key,method,model_version,"
+                "confidence_level,random_seed,n_bootstrap,grid_points,config_json,point_snapshot_json,"
+                "input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (inversion_id,inversion["sample_id"],key,payload["method"],inversion["model_version"],
+                 payload["confidence_level"],payload.get("random_seed"),payload.get("n_bootstrap"),
+                 payload.get("grid_points"),json.dumps(config,ensure_ascii=False),
+                 json.dumps(point_snapshot,ensure_ascii=False),inversion["input_json"],now,now))
+            return dict(connection.execute("SELECT * FROM hydro_inversion_intervals WHERE id=?",(cursor.lastrowid,)).fetchone())
+
+    def run_interval(self, interval_id: int, worker_id: str) -> dict[str, Any]:
+        """执行（或重跑）区间估计任务。
+
+        计算是输入确定性的纯函数：同配置、同点估计、同种子无论重试多少次
+        （甚至跨进程）都产生相同结果。done 任务直接返回已有结果。
+        """
+        with transaction(immediate=True) as connection:
+            task=connection.execute("SELECT * FROM hydro_inversion_intervals WHERE id=?",(interval_id,)).fetchone()
+            if task is None: raise KeyError("interval_not_found")
+            if task["status"]=="done": return dict(task)
+            connection.execute("UPDATE hydro_inversion_intervals SET status='running',attempts=attempts+1,worker_id=?,updated_at=? WHERE id=?",(worker_id,_now(),interval_id))
+        data=json.loads(task["input_json"])
+        ids=data["endmember_ids"]
+        sample=dict(self.connection.execute("SELECT * FROM hydro_samples WHERE id=?",(task["sample_id"],)).fetchone())
+        endmembers=[dict(row) for row in self.connection.execute(f"SELECT * FROM hydro_endmembers WHERE id IN ({','.join('?' for _ in ids)}) ORDER BY id",ids).fetchall()]
+        point_result=json.loads(task["point_snapshot_json"])["result_json"]
+        config=json.loads(task["config_json"])
+        max_iterations=config.get("max_iterations") or data["max_iterations"]
+        tolerance=config.get("tolerance") or data["tolerance"]
+        try:
+            if task["method"]==BOOTSTRAP:
+                result=bootstrap_intervals(sample=sample,endmembers=endmembers,point_result=point_result,
+                    confidence_level=task["confidence_level"],random_seed=task["random_seed"],
+                    n_bootstrap=task["n_bootstrap"],max_iterations=max_iterations,tolerance=tolerance)
+            elif task["method"]==PROFILE:
+                result=profile_intervals(sample=sample,endmembers=endmembers,point_result=point_result,
+                    confidence_level=task["confidence_level"],grid_points=task["grid_points"],
+                    max_iterations=max_iterations,tolerance=tolerance)
+            else:
+                raise ValueError(f"unknown_interval_method:{task['method']}")
+            result.update({"inversion_id":task["inversion_id"],"point_model_version":task["model_version"],
+                           "point_estimate":[{"endmember_id":item["endmember_id"],"name":item["name"],
+                                              "fraction":item["fraction"]} for item in point_result["fractions"]]})
+        except Exception as exc:
+            with transaction(immediate=True) as connection:
+                connection.execute("UPDATE hydro_inversion_intervals SET status='failed',error=?,updated_at=? WHERE id=?",(str(exc),_now(),interval_id))
+            raise
+        with transaction(immediate=True) as connection:
+            connection.execute("UPDATE hydro_inversion_intervals SET status='done',result_json=?,error='',updated_at=? WHERE id=?",(json.dumps(result,ensure_ascii=False),_now(),interval_id))
+            return dict(connection.execute("SELECT * FROM hydro_inversion_intervals WHERE id=?",(interval_id,)).fetchone())
+
+    def list_intervals(self, sample_id: int | None = None, model_version: str | None = None,
+                       confidence_level: float | None = None, method: str | None = None) -> list[dict[str, Any]]:
+        """列出区间任务，供研究人员比较不同置信水平、方法与模型版本。"""
+        clauses=[]; params:list[Any]=[]
+        if sample_id is not None: clauses.append("sample_id=?"); params.append(sample_id)
+        if model_version is not None: clauses.append("model_version=?"); params.append(model_version)
+        if confidence_level is not None: clauses.append("ABS(confidence_level-?)<1e-9"); params.append(confidence_level)
+        if method is not None: clauses.append("method=?"); params.append(method)
+        where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+        rows=self.connection.execute(
+            f"SELECT * FROM hydro_inversion_intervals{where} ORDER BY sample_id,model_version,confidence_level,method,id",params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_interval(self, interval_id: int) -> dict[str, Any] | None:
+        row=self.connection.execute("SELECT * FROM hydro_inversion_intervals WHERE id=?",(interval_id,)).fetchone()
+        return dict(row) if row else None
 
     def run_transport(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None: raise KeyError("well_not_found")
