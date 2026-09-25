@@ -44,6 +44,14 @@ class InversionRequest(BaseModel):
     model_version: str = Field(default="mix-1", min_length=1, max_length=40)
 
 
+class IntervalRequest(BaseModel):
+    method: str = Field(default="parametric-bootstrap", pattern="^(parametric-bootstrap|deterministic-profile)$")
+    confidence_level: float = Field(default=0.95, gt=0.5, le=0.999)
+    replicates: int = Field(default=200, ge=20, le=5000)
+    seed: int = Field(default=20260925, ge=0, le=2**63 - 1)
+    model_version: str = Field(default="interval-1", min_length=1, max_length=40)
+
+
 class TransportRequest(BaseModel):
     source_concentration: float = Field(..., ge=0, le=1000000)
     distance_m: float = Field(..., gt=0, le=1000000)

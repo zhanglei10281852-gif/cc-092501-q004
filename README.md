@@ -6,6 +6,7 @@
 
 - 井点与样本：登记井点坐标、含水层、采样批次和实验室测量结果。
 - 同位素计算：处理稳定同位素、溶质浓度、检测限和质量守恒约束，反演多个补给端元比例。
+- 区间估计：对已完成的混合反演执行固定种子的参数自助法或确定性剖面法，输出每个端元的置信区间、样本数、失败次数和端元相关性诊断；任务可分块恢复，重试不改变同一配置的结果，且不覆盖原始点估计。
 - 污染迁移：计算一维平流、弥散和一阶衰减，提供到达时间和浓度曲线。
 - 任务与审计：保存参数版本、计算输入摘要、置信区间、失败重试和结果差异。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
@@ -61,7 +62,29 @@ curl -sS -X POST http://127.0.0.1:8432/api/auth/bootstrap   -H 'Content-Type: ap
 python -m pytest
 ```
 
-测试覆盖身份初始化、登录、用户与角色维护、权限计算、账号停用后的会话撤销、审计脱敏、井点样本、同位素约束、迁移计算、任务恢复和数据库时间格式。
+测试覆盖身份初始化、登录、用户与角色维护、权限计算、账号停用后的会话撤销、审计脱敏、井点样本、同位素约束、迁移计算、区间估计的可复现性与任务恢复、以及数据库时间格式。
+
+## 混合反演区间估计
+
+反演任务完成后，可对其发起区间估计（同一配置去重，重复提交返回同一任务）：
+
+```bash
+# 提交区间估计任务（202）
+curl -sS -X POST http://127.0.0.1:8432/api/hydro/inversions/<反演任务ID>/intervals \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"parametric-bootstrap","confidence_level":0.95,"replicates":200,"seed":20260925,"model_version":"interval-1"}'
+
+# 执行或恢复任务；可用 chunk_size 分块推进，中断后重复调用即可续算
+curl -sS -X POST 'http://127.0.0.1:8432/api/hydro/intervals/<区间任务ID>/run?worker_id=worker-1&chunk_size=50'
+
+# 查看单个区间任务，或按置信水平、模型版本比较同一反演的全部区间结果
+curl -sS http://127.0.0.1:8432/api/hydro/intervals/<区间任务ID>
+curl -sS 'http://127.0.0.1:8432/api/hydro/inversions/<反演任务ID>/intervals?confidence_level=0.99&model_version=interval-1'
+```
+
+- `method` 支持 `parametric-bootstrap`（按测量误差与端元不确定性扰动、固定种子逐重复生成，结果与执行顺序无关）和 `deterministic-profile`（逐端元固定比例扫描目标函数剖面，阈值取卡方分位数，全程无随机性）。
+- 结果包含每个端元的 `lower`/`upper`/`width`、`samples`（成功样本数）、`failures`（未收敛次数）以及端元间 Pearson 相关性诊断；相关系数绝对值超过 0.8 时给出简并警告。
+- 区间任务只读取反演快照，不回写 `hydro_inversions`，原始点估计保持不变。
 
 ## 编译检查
 

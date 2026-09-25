@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.hydro.schemas import EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
+from app.hydro.schemas import EndmemberCreate, IntervalRequest, InversionRequest, SampleCreate, TransportRequest, WellCreate
 from app.hydro.service import HydroService
 
 router=APIRouter(prefix="/api/hydro",tags=["地下水科学计算"])
@@ -46,6 +46,28 @@ def run_inversion(task_id:int,worker_id:str=Query(...,min_length=1)):
     try: return service().run_inversion(task_id,worker_id)
     except KeyError as exc: raise HTTPException(404,"任务不存在") from exc
     except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.post("/inversions/{inversion_id}/intervals",status_code=202)
+def enqueue_interval(inversion_id:int,payload:IntervalRequest):
+    try: return service().enqueue_interval(inversion_id,payload.model_dump())
+    except KeyError as exc: raise HTTPException(404,"反演任务不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.post("/intervals/{task_id}/run")
+def run_interval(task_id:int,worker_id:str=Query(...,min_length=1),chunk_size:int|None=Query(default=None,ge=1,le=5000)):
+    try: return service().run_interval(task_id,worker_id,chunk_size)
+    except KeyError as exc: raise HTTPException(404,"区间任务不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.get("/intervals/{task_id}")
+def get_interval(task_id:int):
+    value=service().get_interval(task_id)
+    if value is None: raise HTTPException(404,"区间任务不存在")
+    return value
+
+@router.get("/inversions/{inversion_id}/intervals")
+def list_intervals(inversion_id:int,confidence_level:float|None=Query(default=None),model_version:str|None=Query(default=None)):
+    return {"items":service().list_intervals(inversion_id,confidence_level,model_version)}
 
 @router.post("/wells/{well_id}/transport",status_code=201)
 def run_transport(well_id:int,payload:TransportRequest):
